@@ -1,0 +1,64 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * Entry point for the JMX example application that registers example MBeans for integration testing.
+ *
+ * <p>Registers instances of {@link TabularData}, {@link AutoIncrementing}, {@link ExistDb},
+ * {@link PerformanceMetrics}, {@link CustomValue}, and {@link StringValue} with the platform
+ * MBean server, then blocks the main thread to keep the JVM alive for scraping.
+ */
+public class JmxExampleApplication {
+
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+
+    /**
+     * Private constructor to prevent instantiation of this utility class.
+     */
+    private JmxExampleApplication() {
+        // Intentionally empty
+    }
+
+    /**
+     * Registers all example MBeans with the platform MBean server and blocks the current thread
+     * to keep the JVM alive for JMX scraping.
+     *
+     * @param args command-line arguments, ignored
+     * @throws Exception if any MBean registration fails or the thread is interrupted while waiting
+     */
+    public static void main(String[] args) throws Exception {
+        new TabularData().register();
+        new AutoIncrementing().register();
+        new ExistDb().register();
+        new PerformanceMetrics().register();
+        new CustomValue().register();
+        new StringValue().register();
+
+        System.out.printf(
+                "%s | %s | INFO | %s | %s%n",
+                LocalDateTime.now().format(DATE_TIME_FORMATTER),
+                Thread.currentThread().getName(),
+                JmxExampleApplication.class.getName(),
+                "Running ...");
+
+        Thread.currentThread().join();
+    }
+}

@@ -1,0 +1,237 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx.common.authenticator;
+
+import com.sun.net.httpserver.BasicAuthenticator;
+import io.prometheus.jmx.common.util.Precondition;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+
+/**
+ * Basic authenticator that validates credentials using salted message digest password hashing.
+ *
+ * <p>Supports SHA-1, SHA-256, and SHA-512 algorithms. Passwords are hashed using the formula:
+ * {@code hash(algorithm, salt + ":" + password)}.
+ *
+ * <p>This authenticator caches valid credentials to improve authentication performance,
+ * using a maximum credential size of 5 KiB and an approximately
+ * 500 KiB maximum cache weight. Valid credentials are looked up in the cache before the
+ * (potentially expensive) password hash is computed; invalid credentials are never cached.
+ *
+ * <p>Thread-safety: This class is thread-safe. Credential cache operations are thread-safe,
+ * backed by Caffeine. Password hash comparison is constant-time.
+ *
+ * @see PlaintextAuthenticator
+ * @see PBKDF2Authenticator
+ */
+public class MessageDigestAuthenticator extends BasicAuthenticator {
+
+    /**
+     * Maximum size for a single cached credential value in bytes (5 KiB).
+     */
+    private static final int MAXIMUM_CREDENTIAL_VALUE_SIZE_BYTES = CredentialsCache.DEFAULT_MAX_VALUE_SIZE_BYTES;
+
+    /**
+     * Maximum number of entries per credential cache.
+     */
+    private static final int MAXIMUM_CREDENTIAL_CACHE_ENTRIES = CredentialsCache.DEFAULT_MAX_ENTRIES;
+
+    /**
+     * Hexadecimal characters for converting bytes to hex strings.
+     */
+    private static final char[] HEXADECIMAL_CHARACTERS = {
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+    };
+
+    /**
+     * The expected username for authentication.
+     */
+    private final byte[] usernameBytes;
+
+    /**
+     * The expected password hash for authentication (stored as bytes for constant-time comparison).
+     */
+    private final byte[] passwordHashBytes;
+
+    /**
+     * The hashing algorithm (SHA-1, SHA-256, or SHA-512).
+     */
+    private final String algorithm;
+
+    /**
+     * The salt used in password hashing.
+     */
+    private final String salt;
+
+    /**
+     * Cache for valid credentials.
+     */
+    private final CredentialsCache credentialsCache;
+
+    /**
+     * Package-private counter of verification passes actually performed (i.e., cache misses).
+     * Package-private for testing the credential cache read path; not used in production logic.
+     */
+    private int verificationCount;
+
+    /**
+     * Constructs a message digest authenticator with the specified parameters.
+     *
+     * @param realm the HTTP authentication realm, must not be {@code null} or blank
+     * @param username the expected username, must not be {@code null} or blank
+     * @param passwordHash the expected password hash, must not be {@code null} or blank
+     * @param algorithm the hashing algorithm (SHA-1, SHA-256, or SHA-512), must not be {@code null}
+     *     or blank
+     * @param salt the salt used in hashing, must not be {@code null} or blank
+     * @throws GeneralSecurityException if the algorithm is not supported
+     * @throws NullPointerException if any parameter is {@code null}
+     * @throws IllegalArgumentException if any parameter is blank
+     */
+    public MessageDigestAuthenticator(String realm, String username, String passwordHash, String algorithm, String salt)
+            throws GeneralSecurityException {
+        super(realm);
+
+        Precondition.notNullOrEmpty(username);
+        Precondition.notNullOrEmpty(passwordHash);
+        Precondition.notNullOrEmpty(algorithm);
+        Precondition.notNullOrEmpty(salt);
+
+        MessageDigest.getInstance(algorithm);
+
+        this.usernameBytes = username.getBytes(StandardCharsets.UTF_8);
+        this.passwordHashBytes = hexStringToByteArray(passwordHash.toLowerCase().replace(":", ""));
+        this.algorithm = algorithm;
+        this.salt = salt;
+        this.credentialsCache =
+                new CredentialsCache(MAXIMUM_CREDENTIAL_VALUE_SIZE_BYTES, MAXIMUM_CREDENTIAL_CACHE_ENTRIES);
+    }
+
+    /**
+     * Validates the presented credentials using valid-only credential caching and
+     * constant-time comparison.
+     *
+     * <p>A hash is computed and compared using {@link MessageDigest#isEqual(byte[], byte[])} for
+     * constant-time comparison. Valid credentials are cached; invalid credentials are never cached.
+     *
+     * @param username the presented username, may be {@code null}
+     * @param password the presented password, may be {@code null}
+     * @return {@code true} if both username and password match, {@code false} if either is
+     *     {@code null} or they do not match
+     */
+    @Override
+    public boolean checkCredentials(String username, String password) {
+        if (username == null || password == null) {
+            return false;
+        }
+
+        if (credentialsCache.contains(username, password)) {
+            return true;
+        }
+        verificationCount++;
+
+        byte[] candidateHashBytes = generatePasswordHashBytes(algorithm, salt, password);
+        boolean usernameMatches = MessageDigest.isEqual(this.usernameBytes, username.getBytes(StandardCharsets.UTF_8));
+        boolean passwordMatches = MessageDigest.isEqual(this.passwordHashBytes, candidateHashBytes);
+        boolean isValid = usernameMatches & passwordMatches;
+
+        if (isValid) {
+            credentialsCache.add(username, password);
+        }
+
+        return isValid;
+    }
+
+    /**
+     * Generates a password hash using the configured message digest algorithm.
+     *
+     * @param algorithm the hashing algorithm
+     * @param salt the salt
+     * @param password the password to hash
+     * @return the lowercase hexadecimal hash
+     * @throws RuntimeException if the algorithm is not supported
+     */
+    private static String generatePasswordHash(String algorithm, String salt, String password) {
+        byte[] hashBytes = generatePasswordHashBytes(algorithm, salt, password);
+        return toLowerCaseHexadecimal(hashBytes);
+    }
+
+    /**
+     * Generates a password hash as bytes for constant-time comparison.
+     *
+     * @param algorithm the hashing algorithm
+     * @param salt the salt
+     * @param password the password to hash
+     * @return the hash as a byte array
+     * @throws RuntimeException if the algorithm is not supported
+     */
+    private static byte[] generatePasswordHashBytes(String algorithm, String salt, String password) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            return digest.digest((salt + ":" + password).getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Converts a byte array to a lowercase hexadecimal string.
+     *
+     * @param bytes the byte array to convert
+     * @return the lowercase hexadecimal string representation
+     */
+    private static String toLowerCaseHexadecimal(byte[] bytes) {
+        int len = bytes.length;
+        char[] result = new char[len * 2];
+
+        for (int i = 0, j = 0; i < len; i++) {
+            int v = bytes[i] & 0xFF;
+            result[j++] = HEXADECIMAL_CHARACTERS[v >>> 4];
+            result[j++] = HEXADECIMAL_CHARACTERS[v & 0x0F];
+        }
+
+        return new String(result);
+    }
+
+    /**
+     * Converts a hexadecimal string to a byte array.
+     *
+     * @param hex the hexadecimal string to convert
+     * @return the byte array representation
+     * @throws IllegalArgumentException if the hex string is invalid
+     */
+    private static byte[] hexStringToByteArray(String hex) {
+        int len = hex.length();
+        if (len % 2 != 0) {
+            throw new IllegalArgumentException("Hex string must have an even length");
+        }
+        byte[] bytes = new byte[len / 2];
+
+        for (int i = 0; i < len; i += 2) {
+            int highNibble = Character.digit(hex.charAt(i), 16);
+            int lowNibble = Character.digit(hex.charAt(i + 1), 16);
+
+            if (highNibble < 0 || lowNibble < 0) {
+                throw new IllegalArgumentException("Hex string contains a non-hexadecimal character");
+            }
+
+            bytes[i / 2] = (byte) ((highNibble << 4) + lowNibble);
+        }
+
+        return bytes;
+    }
+}

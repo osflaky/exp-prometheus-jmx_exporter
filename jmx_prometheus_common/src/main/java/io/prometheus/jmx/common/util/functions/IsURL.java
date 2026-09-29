@@ -1,0 +1,93 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx.common.util.functions;
+
+import io.prometheus.jmx.common.util.Precondition;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/**
+ * Function that validates a String is a valid URL.
+ *
+ * <p>This function uses {@link java.net.URI#create(String)} and {@link java.net.URL} to validate
+ * that the string represents a well-formed URL. If validation fails, it throws an exception from
+ * the provided supplier.
+ *
+ * <p>Example usage:
+ *
+ * <pre>{@code
+ * Function<String, String> validator = IsURL.of(() -> new ConfigurationException("Invalid URL"));
+ * String result = validator.apply("http://localhost:8080");  // Returns the URL string
+ * validator.apply("not a url");  // Throws ConfigurationException
+ * }</pre>
+ *
+ * <p>Thread-safety: This class is thread-safe. Each invocation operates on the input independently.
+ */
+public class IsURL implements Function<String, String> {
+
+    /**
+     * Supplier for the exception to throw when validation fails.
+     */
+    private final Supplier<? extends RuntimeException> supplier;
+
+    /**
+     * Constructs an IsURL validator with the specified exception supplier.
+     *
+     * @param supplier supplier for the exception to throw when validation fails, must not be
+     *     {@code null}
+     * @throws NullPointerException if {@code supplier} is {@code null}
+     */
+    private IsURL(Supplier<? extends RuntimeException> supplier) {
+        Precondition.notNull(supplier);
+        this.supplier = supplier;
+    }
+    /**
+     * Validates that the string is a well-formed URL.
+     *
+     * @param value the string to validate
+     * @return the validated URL string, unchanged
+     * @throws RuntimeException if the string is blank or not a valid URL, as supplied by the
+     *     configured exception supplier
+     */
+    @Override
+    public String apply(String value) {
+        if (value.trim().isEmpty()) {
+            throw supplier.get();
+        }
+
+        try {
+            URI.create(value).toURL();
+            return value;
+        } catch (MalformedURLException e) {
+            throw supplier.get();
+        }
+    }
+
+    /**
+     * Creates an IsURL validator with the specified exception supplier.
+     *
+     * @param supplier supplier for the exception to throw when validation fails, must not be
+     *     {@code null}
+     * @return a new IsURL instance
+     * @throws NullPointerException if {@code supplier} is {@code null}
+     */
+    public static IsURL of(Supplier<? extends RuntimeException> supplier) {
+        return new IsURL(supplier);
+    }
+}

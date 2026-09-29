@@ -1,0 +1,596 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx.common.http;
+
+import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThatExceptionOfType;
+
+import io.prometheus.jmx.common.ConfigurationException;
+import io.prometheus.jmx.common.HTTPServerFactory;
+import io.prometheus.jmx.common.util.MapAccessor;
+import io.prometheus.jmx.common.util.YamlSupport;
+import io.prometheus.metrics.exporter.httpserver.HTTPServer;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+public class HTTPServerFactoryTest {
+
+    @TempDir
+    File temporaryFolder;
+
+    HTTPServer httpServer;
+
+    PrometheusRegistry prometheusRegistry;
+
+    @BeforeEach
+    public void setUp() {
+        prometheusRegistry = new PrometheusRegistry();
+    }
+
+    @AfterEach
+    public void stopServer() {
+        if (httpServer != null) {
+            httpServer.stop();
+        }
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClass451RoundTrip() throws Exception {
+        File config = new File(temporaryFolder, "ok");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:" + " io.prometheus.jmx.common.http.authenticator.CustomAuthenticator451");
+        writer.close();
+
+        httpServer = startServer(config);
+
+        verifyExpectedResponse(httpServer, "HTTP/1.1 451");
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassSubjectOkRoundTrip() throws Exception {
+        File config = new File(temporaryFolder, "ok");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:" + " io.prometheus.jmx.common.http.authenticator.CustomAuthenticatorWithSubject");
+        writer.println("      subjectAttributeName: custom.subject");
+
+        writer.close();
+
+        httpServer = startServer(config);
+
+        verifyExpectedResponse(httpServer, "HTTP/1.1 200 OK");
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassSubjectNotMatchingRoundTrip() throws Exception {
+        File config = new File(temporaryFolder, "unmatched_subjectAttributeName");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:" + " io.prometheus.jmx.common.http.authenticator.CustomAuthenticatorWithSubject");
+        writer.println("      subjectAttributeName: not.the.correct.custom.subject.attribute");
+
+        writer.close();
+
+        httpServer = startServer(config);
+
+        verifyExpectedResponse(httpServer, "HTTP/1.1 403");
+    }
+
+    private void verifyExpectedResponse(HTTPServer httpServer, String expectedResponseSubString) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.setSoTimeout(1000);
+            socket.connect(new InetSocketAddress("localhost", httpServer.getPort()));
+            socket.getOutputStream().write("GET /metrics HTTP/1.1 \r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().write("HOST: localhost \r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+
+            String actualResponse = "";
+            byte[] resp = new byte[500];
+            int read = socket.getInputStream().read(resp, 0, resp.length);
+            if (read > 0) {
+                actualResponse = new String(resp, 0, read);
+            }
+            assertThat(actualResponse).contains(expectedResponseSubString);
+        }
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassNOkNoConstructor() throws Exception {
+        File config = new File(temporaryFolder, "error_no_constructor");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:" + " io.prometheus.jmx.common.authenticator.PlaintextAuthenticator");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassNokNotFound() throws Exception {
+        File config = new File(temporaryFolder, "notFound");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:" + " myio.jmx.common.notThere.authenticator.PlaintextAuthenticator");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassNokNotString() throws Exception {
+        File config = new File(temporaryFolder, "as_int");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("       class: 10");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomAuthenticatorClassNokMissingString() throws Exception {
+        File config = new File(temporaryFolder, "missing");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    plugin:");
+        writer.println("      class:");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithoutInetAddress() throws Exception {
+        File config = new File(temporaryFolder, "no_inetAddress");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 2");
+        writer.println("    maximum: 5");
+        writer.println("    keepAliveTime: 60");
+        writer.close();
+
+        httpServer = HTTPServerFactory.createAndStartHTTPServer(prometheusRegistry, config);
+        assertThat(httpServer).isNotNull();
+        assertThat(httpServer.getPort()).isGreaterThan(0);
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithCustomMetricsPath() throws Exception {
+        File config = new File(temporaryFolder, "custom_metrics");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  metrics:");
+        writer.println("    path: /custom/metrics");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithBlankMetricsPath() throws Exception {
+        File config = new File(temporaryFolder, "blank_metrics");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  metrics:");
+        writer.println("    path: \"   \"");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithInvalidKeepAliveTime() throws Exception {
+        File config = new File(temporaryFolder, "invalid_keepalive");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 10");
+        writer.println("    keepAliveTime: 0");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithNegativeKeepAliveTime() throws Exception {
+        File config = new File(temporaryFolder, "negative_keepalive");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 10");
+        writer.println("    keepAliveTime: -5");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithNonIntegerKeepAliveTime() throws Exception {
+        File config = new File(temporaryFolder, "non_integer_keepalive");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 10");
+        writer.println("    keepAliveTime: abc");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithPlaintextAuthentication() throws Exception {
+        File config = new File(temporaryFolder, "plaintext_auth");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      password: testpass");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithPlaintextAuthenticationAndVariable() throws Exception {
+        File config = new File(temporaryFolder, "plaintext_auth_var");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      password: testpass");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithSHA256Authentication() throws Exception {
+        File config = new File(temporaryFolder, "sha256_auth");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      algorithm: SHA-256");
+        writer.println("      passwordHash: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d15ee50");
+        writer.println("      salt: testsalt");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithPBKDF2Authentication() throws Exception {
+        File config = new File(temporaryFolder, "pbkdf2_auth");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      algorithm: PBKDF2WithHmacSHA256");
+        writer.println("      passwordHash: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d15ee50");
+        writer.println("      salt: testsalt");
+        writer.println("      iterations: 600000");
+        writer.println("      keyLength: 256");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithPBKDF2AuthenticationDefaultIterations() throws Exception {
+        File config = new File(temporaryFolder, "pbkdf2_default_iter");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      algorithm: PBKDF2WithHmacSHA1");
+        writer.println("      passwordHash: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d15ee50");
+        writer.println("      salt: testsalt");
+        writer.println("      keyLength: 256");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithInvalidAlgorithm() throws Exception {
+        File config = new File(temporaryFolder, "invalid_algorithm");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      algorithm: INVALID-ALGO");
+        writer.println("      passwordHash: somehash");
+        writer.println("      salt: testsalt");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithBlankPassword() throws Exception {
+        File config = new File(temporaryFolder, "blank_password");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      password: \"   \"");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithMissingPassword() throws Exception {
+        File config = new File(temporaryFolder, "missing_password");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      password:");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void createAndStartHTTPServerWithMissingSalt() throws Exception {
+        File config = new File(temporaryFolder, "missing_salt");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  authentication:");
+        writer.println("    basic:");
+        writer.println("      username: testuser");
+        writer.println("      algorithm: SHA-256");
+        writer.println("      passwordHash: somehash");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void maximumThreadsExceeds256Rejected() throws Exception {
+        File config = new File(temporaryFolder, "max_threads_257");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 257");
+        writer.println("    keepAliveTime: 120");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void maximumThreads256Accepted() throws Exception {
+        File config = new File(temporaryFolder, "max_threads_256");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 256");
+        writer.println("    keepAliveTime: 120");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void serverReturns429WhenPoolSaturated() throws Exception {
+        File config = new File(temporaryFolder, "max_threads_1");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 1");
+        writer.println("    keepAliveTime: 120");
+        writer.close();
+
+        httpServer = startServer(config);
+
+        // Send a slow request to occupy the pool thread
+        try (Socket slowSocket = new Socket()) {
+            slowSocket.setSoTimeout(5000);
+            slowSocket.connect(new InetSocketAddress("localhost", httpServer.getPort()));
+            // Send a partial request to keep the pool thread busy reading headers
+            slowSocket.getOutputStream().write("GET /metrics HTTP/1.1\r\n".getBytes(StandardCharsets.UTF_8));
+            slowSocket.getOutputStream().flush();
+
+            // Give the pool thread time to pick up the task
+            Thread.sleep(200);
+
+            // Send a second request which should get 429
+            try (Socket fastSocket = new Socket()) {
+                fastSocket.setSoTimeout(5000);
+                fastSocket.connect(new InetSocketAddress("localhost", httpServer.getPort()));
+                fastSocket.getOutputStream().write("GET /-/healthy HTTP/1.1\r\n".getBytes(StandardCharsets.UTF_8));
+                fastSocket.getOutputStream().write("HOST: localhost\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+                fastSocket.getOutputStream().flush();
+
+                byte[] resp = new byte[500];
+                int read = fastSocket.getInputStream().read(resp, 0, resp.length);
+                String response = "";
+                if (read > 0) {
+                    response = new String(resp, 0, read);
+                }
+                assertThat(response).contains("HTTP/1.1 429");
+            }
+        }
+    }
+
+    @Test
+    public void no429WhenPoolHasCapacity() throws Exception {
+        File config = new File(temporaryFolder, "max_threads_10");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  threads:");
+        writer.println("    minimum: 1");
+        writer.println("    maximum: 10");
+        writer.println("    keepAliveTime: 120");
+        writer.close();
+
+        httpServer = startServer(config);
+
+        try (Socket socket = new Socket()) {
+            socket.setSoTimeout(5000);
+            socket.connect(new InetSocketAddress("localhost", httpServer.getPort()));
+            socket.getOutputStream().write("GET /-/healthy HTTP/1.1\r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().write("HOST: localhost\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+
+            byte[] resp = new byte[500];
+            int read = socket.getInputStream().read(resp, 0, resp.length);
+            String response = "";
+            if (read > 0) {
+                response = new String(resp, 0, read);
+            }
+            assertThat(response).doesNotContain("HTTP/1.1 429");
+        }
+    }
+
+    @Test
+    public void maximumRequestSecondsNegativeRejected() throws Exception {
+        File config = new File(temporaryFolder, "max_req_seconds_neg");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  maximumRequestSeconds: -1");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void maximumRequestSecondsZeroRejected() throws Exception {
+        File config = new File(temporaryFolder, "max_req_seconds_zero");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  maximumRequestSeconds: 0");
+        writer.close();
+
+        assertThatExceptionOfType(ConfigurationException.class).isThrownBy(() -> httpServer = startServer(config));
+    }
+
+    @Test
+    public void maximumRequestSecondsAbsentIsFine() throws Exception {
+        File config = new File(temporaryFolder, "no_max_req_seconds");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void maximumRequestSecondsValidAccepted() throws Exception {
+        File config = new File(temporaryFolder, "max_req_seconds_60");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  maximumRequestSeconds: 60");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void defaultConfigUnchangedWithoutThreadsSection() throws Exception {
+        File config = new File(temporaryFolder, "no_threads_section");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.close();
+
+        httpServer = startServer(config);
+        assertThat(httpServer).isNotNull();
+    }
+
+    @Test
+    public void createAndStartHTTPServerFromMapAccessorHonorsMetricsPath() throws Exception {
+        File config = new File(temporaryFolder, "map_accessor_metrics_path");
+        PrintWriter writer = new PrintWriter(config);
+        writer.println("httpServer:");
+        writer.println("  metrics:");
+        writer.println("    path: /custom");
+        writer.close();
+
+        MapAccessor rootMapAccessor = MapAccessor.of(YamlSupport.loadYaml(config));
+
+        httpServer = HTTPServerFactory.createAndStartHTTPServer(
+                prometheusRegistry, InetAddress.getByName("0.0.0.0"), 0, rootMapAccessor);
+
+        try (Socket socket = new Socket()) {
+            socket.setSoTimeout(1000);
+            socket.connect(new InetSocketAddress("localhost", httpServer.getPort()));
+            socket.getOutputStream().write("GET /custom HTTP/1.1 \r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().write("HOST: localhost \r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+
+            byte[] response = new byte[500];
+            int read = socket.getInputStream().read(response, 0, response.length);
+            String actualResponse = read > 0 ? new String(response, 0, read, StandardCharsets.UTF_8) : "";
+            assertThat(actualResponse).contains("HTTP/1.1 200");
+        }
+    }
+
+    private HTTPServer startServer(File config) throws IOException {
+        return HTTPServerFactory.createAndStartHTTPServer(
+                prometheusRegistry, InetAddress.getByName("0.0.0.0"), 0, config);
+    }
+}

@@ -1,0 +1,1359 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx;
+
+import static java.lang.String.format;
+
+import io.prometheus.jmx.MatchedRulesCache.CacheKey;
+import io.prometheus.jmx.logger.Logger;
+import io.prometheus.jmx.logger.LoggerFactory;
+import io.prometheus.jmx.variable.VariableResolver;
+import io.prometheus.metrics.core.metrics.Counter;
+import io.prometheus.metrics.core.metrics.Gauge;
+import io.prometheus.metrics.model.registry.MultiCollector;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import io.prometheus.metrics.model.snapshots.MetricSnapshots;
+import io.prometheus.metrics.model.snapshots.Unit;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+import org.yaml.snakeyaml.LoaderOptions;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+
+/**
+ * Class to implement JmxCollector
+ */
+@SuppressWarnings("unchecked")
+public class JmxCollector implements MultiCollector {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(JmxCollector.class);
+
+    /**
+     * Enum to implement Mode
+     */
+    public enum Mode {
+
+        /**
+         * Agent mode
+         */
+        AGENT,
+
+        /**
+         * Standalone mode
+         */
+        STANDALONE
+    }
+
+    private final Mode mode;
+
+    /**
+     * Represents an extra metric to be exported.
+     * <p>
+     * Package-private class used internally to define custom metrics.
+     */
+    static class ExtraMetric {
+
+        String name;
+        Object value;
+        String description;
+    }
+
+    /**
+     * Represents a rule for matching and transforming JMX metrics.
+     * <p>
+     * Package-private class used internally to define metric collection rules.
+     */
+    static class Rule {
+
+        Pattern pattern;
+        String name;
+        String value;
+        Double valueFactor = 1.0;
+        String help;
+        boolean attrNameSnakeCase;
+        boolean cache = false;
+        String type = "UNKNOWN";
+        ArrayList<String> labelNames;
+        ArrayList<String> labelValues;
+    }
+
+    static class SslProperties {
+
+        boolean enabled = false;
+        KeyStoreProperties keyStoreProperties;
+        KeyStoreProperties trustStoreProperties;
+        List<String> protocols = Collections.emptyList();
+        List<String> ciphers = Collections.emptyList();
+
+        public SslProperties() {
+            // Intentionally empty
+        }
+
+        public SslProperties(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public Optional<KeyStoreProperties> getKeyStoreProperties() {
+            return Optional.ofNullable(keyStoreProperties);
+        }
+
+        public Optional<KeyStoreProperties> getTrustStoreProperties() {
+            return Optional.ofNullable(trustStoreProperties);
+        }
+    }
+
+    static class KeyStoreProperties {
+
+        Path path;
+        String type;
+        char[] password;
+    }
+
+    /**
+     * Customizes metric collection for specific MBeans.
+     * <p>
+     * Allows configuration of MBean filtering, attributes-as-labels, and extra metrics.
+     */
+    public static class MetricCustomizer {
+        MBeanFilter mbeanFilter;
+        List<String> attributesAsLabels;
+        List<ExtraMetric> extraMetrics;
+
+        /**
+         * Creates a new MetricCustomizer with default values.
+         */
+        public MetricCustomizer() {
+            // Intentionally empty
+        }
+    }
+
+    /**
+     * Filters MBeans based on domain and properties.
+     * <p>
+     * Used to select specific MBeans for metric customization.
+     */
+    public static class MBeanFilter {
+
+        String domain;
+        Map<String, String> properties;
+
+        /**
+         * Creates a new MBeanFilter with default values.
+         */
+        public MBeanFilter() {
+            // Intentionally empty
+        }
+    }
+
+    /**
+     * Class to implement Config
+     */
+    private static class Config {
+
+        Integer startDelaySeconds = 0;
+        String jmxUrl = "";
+        String username = "";
+        String password = "";
+        SslProperties sslProperties = new SslProperties();
+        boolean lowercaseOutputName;
+        boolean lowercaseOutputLabelNames;
+        boolean inferCounterTypeFromName;
+        final List<ObjectName> includeObjectNames = new ArrayList<>();
+        final List<ObjectName> excludeObjectNames = new ArrayList<>();
+        ObjectNameAttributeFilter objectNameAttributeFilter;
+        boolean excludeJvmMetrics = false;
+        final List<Rule> rules = new ArrayList<>();
+        long lastUpdate = 0L;
+        List<MetricCustomizer> metricCustomizers = new ArrayList<>();
+        MatchedRulesCache rulesCache;
+        Integer scrapeTimeoutSeconds = null;
+    }
+
+    private Config config;
+    private File configFile;
+    private final long createTimeMillis = System.currentTimeMillis();
+
+    private Counter configReloadSuccess;
+    private Counter configReloadFailure;
+    private Gauge jmxScrapeDurationSeconds;
+    private Gauge jmxScrapeError;
+    private Gauge jmxScrapeCachedBeans;
+    private Counter scrapeTimeoutCounter;
+
+    private static final int DEFAULT_POOL_SIZE = Runtime.getRuntime().availableProcessors();
+
+    private final ExecutorService scrapeExecutor;
+
+    private final AtomicReference<Future<MetricSnapshots>> inFlightScrape = new AtomicReference<>(null);
+    private volatile MetricSnapshots lastGoodSnapshots = MetricSnapshots.of();
+
+    private final JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
+
+    /**
+     * Constructor
+     *
+     * @param in the configuration file, must not be null
+     * @throws IOException if an I/O error occurs
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(File in) throws IOException, MalformedObjectNameException {
+        this(in, null);
+    }
+
+    /**
+     * Constructor
+     *
+     * @param in the configuration file, must not be null
+     * @param mode the collector mode, may be null
+     * @throws IOException if an I/O error occurs
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(File in, Mode mode) throws IOException, MalformedObjectNameException {
+        this(in, mode, DEFAULT_POOL_SIZE);
+    }
+
+    /**
+     * Constructor
+     *
+     * @param in the configuration file, must not be null
+     * @param mode the collector mode, may be null
+     * @param poolSize the maximum number of concurrent scrapes, must be at least 1
+     * @throws IOException if an I/O error occurs
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(File in, Mode mode, int poolSize) throws IOException, MalformedObjectNameException {
+        Objects.requireNonNull(in, "configuration file must not be null");
+        configFile = in;
+        this.mode = mode;
+        scrapeExecutor = createScrapeExecutor(poolSize);
+        try (FileReader fr = new FileReader(in)) {
+            config = loadConfig(new Yaml(new SafeConstructor(new LoaderOptions())).load(fr));
+        }
+        config.lastUpdate = configFile.lastModified();
+        exitOnConfigError();
+    }
+
+    /**
+     * Constructor
+     *
+     * @param yamlConfig the YAML configuration string, must not be null
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(String yamlConfig) throws MalformedObjectNameException {
+        this(yamlConfig, DEFAULT_POOL_SIZE);
+    }
+
+    /**
+     * Constructor
+     *
+     * @param yamlConfig the YAML configuration string, must not be null
+     * @param poolSize the maximum number of concurrent scrapes, must be at least 1
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(String yamlConfig, int poolSize) throws MalformedObjectNameException {
+        Objects.requireNonNull(yamlConfig, "YAML configuration must not be null");
+        scrapeExecutor = createScrapeExecutor(poolSize);
+        config = loadConfig(new Yaml(new SafeConstructor(new LoaderOptions())).load(yamlConfig));
+        mode = null;
+    }
+
+    /**
+     * Constructor
+     *
+     * @param inputStream the input stream containing YAML configuration, must not be null
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(InputStream inputStream) throws MalformedObjectNameException {
+        this(inputStream, DEFAULT_POOL_SIZE);
+    }
+
+    /**
+     * Constructor
+     *
+     * @param inputStream the input stream containing YAML configuration, must not be null
+     * @param poolSize the maximum number of concurrent scrapes, must be at least 1
+     * @throws MalformedObjectNameException if the ObjectName is invalid
+     */
+    public JmxCollector(InputStream inputStream, int poolSize) throws MalformedObjectNameException {
+        Objects.requireNonNull(inputStream, "input stream must not be null");
+        scrapeExecutor = createScrapeExecutor(poolSize);
+        config = loadConfig(new Yaml(new SafeConstructor(new LoaderOptions())).load(inputStream));
+        mode = null;
+    }
+
+    private static ExecutorService createScrapeExecutor(int poolSize) {
+        if (poolSize < 1) {
+            throw new IllegalArgumentException("poolSize must be at least 1");
+        }
+        ThreadPoolExecutor executor =
+                new ThreadPoolExecutor(poolSize, poolSize, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                    Thread thread = new Thread(r, "jmx-scrape");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
+    /**
+     * Registers this collector with the default Prometheus registry.
+     *
+     * @return this JmxCollector instance for method chaining
+     */
+    public JmxCollector register() {
+        return register(PrometheusRegistry.defaultRegistry);
+    }
+
+    /**
+     * Registers this collector with the specified Prometheus registry.
+     *
+     * @param prometheusRegistry the registry to register with, must not be null
+     * @return this JmxCollector instance for method chaining
+     */
+    public JmxCollector register(PrometheusRegistry prometheusRegistry) {
+        Objects.requireNonNull(prometheusRegistry, "Prometheus registry must not be null");
+        configReloadSuccess = Counter.builder()
+                .name("jmx_config_reload_success_total")
+                .help("Number of times configuration have successfully been reloaded.")
+                .register(prometheusRegistry);
+
+        configReloadFailure = Counter.builder()
+                .name("jmx_config_reload_failure_total")
+                .help("Number of times configuration have failed to be reloaded.")
+                .register(prometheusRegistry);
+
+        jmxScrapeDurationSeconds = Gauge.builder()
+                .name("jmx_scrape_duration_seconds")
+                .help("Time this JMX scrape took, in seconds.")
+                .unit(Unit.SECONDS)
+                .register(prometheusRegistry);
+
+        jmxScrapeError = Gauge.builder()
+                .name("jmx_scrape_error")
+                .help("Non-zero if this scrape failed.")
+                .register(prometheusRegistry);
+
+        jmxScrapeCachedBeans = Gauge.builder()
+                .name("jmx_scrape_cached_beans")
+                .help("Number of beans with their matching rule cached")
+                .register(prometheusRegistry);
+
+        scrapeTimeoutCounter = Counter.builder()
+                .name("jmx_scrape_timeout_total")
+                .help("Total number of scrape timeouts.")
+                .register(prometheusRegistry);
+
+        prometheusRegistry.register(this);
+
+        return this;
+    }
+
+    private void exitOnConfigError() {
+        if (mode == Mode.AGENT && !config.jmxUrl.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Configuration error: When running jmx_exporter as a Java agent, you must not"
+                            + " configure 'jmxUrl' or 'hostPort' because you don't want to monitor a"
+                            + " remote JVM.");
+        }
+        if (mode == Mode.STANDALONE && config.jmxUrl.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Configuration error: When running jmx_exporter in standalone mode (using"
+                            + " jmx_prometheus_standalone-*.jar) you must configure 'jmxUrl' or"
+                            + " 'hostPort'.");
+        }
+    }
+
+    private void reloadConfig() {
+        try (FileReader fr = new FileReader(configFile)) {
+            Map<String, Object> newYamlConfig = new Yaml(new SafeConstructor(new LoaderOptions())).load(fr);
+            Config newConfig = loadConfig(newYamlConfig);
+            newConfig.lastUpdate = configFile.lastModified();
+            config = newConfig;
+            configReloadSuccess.inc();
+        } catch (Exception e) {
+            LOGGER.error("Configuration reload failed: %s: ", e);
+            configReloadFailure.inc();
+        }
+    }
+
+    private synchronized Config getLatestConfig() {
+        if (configFile != null) {
+            long lastModified = configFile.lastModified();
+            if (lastModified > config.lastUpdate) {
+                LOGGER.trace("Configuration file changed, reloading...");
+                reloadConfig();
+            }
+        }
+        exitOnConfigError();
+        return config;
+    }
+
+    private Config loadConfig(Map<String, Object> yamlConfig) throws MalformedObjectNameException {
+        Config cfg = new Config();
+
+        if (yamlConfig == null) { // Yaml config empty, set config to empty map.
+            yamlConfig = new HashMap<>();
+        }
+
+        if (yamlConfig.containsKey("startDelaySeconds")) {
+            try {
+                cfg.startDelaySeconds = (Integer) yamlConfig.get("startDelaySeconds");
+                if (cfg.startDelaySeconds < 0) {
+                    throw new IllegalArgumentException("startDelaySeconds must be non-negative");
+                }
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Invalid number provided for startDelaySeconds", e);
+            }
+        }
+
+        if (yamlConfig.containsKey("scrapeTimeoutSeconds")) {
+            try {
+                cfg.scrapeTimeoutSeconds = (Integer) yamlConfig.get("scrapeTimeoutSeconds");
+                if (cfg.scrapeTimeoutSeconds <= 0) {
+                    throw new IllegalArgumentException("scrapeTimeoutSeconds must be at least 1");
+                }
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Invalid number provided for scrapeTimeoutSeconds", e);
+            }
+        }
+
+        if (yamlConfig.containsKey("hostPort")) {
+            if (yamlConfig.containsKey("jmxUrl")) {
+                throw new IllegalArgumentException("At most one of hostPort and jmxUrl must be provided");
+            }
+            cfg.jmxUrl = "service:jmx:rmi:///jndi/rmi://" + yamlConfig.get("hostPort") + "/jmxrmi";
+        } else if (yamlConfig.containsKey("jmxUrl")) {
+            cfg.jmxUrl = (String) yamlConfig.get("jmxUrl");
+        }
+
+        if (yamlConfig.containsKey("username")) {
+            String username = (String) yamlConfig.get("username");
+            cfg.username = VariableResolver.resolveVariable(username);
+        }
+
+        if (yamlConfig.containsKey("password")) {
+            String password = (String) yamlConfig.get("password");
+            cfg.password = VariableResolver.resolveVariable(password);
+        }
+
+        Object sslValue = yamlConfig.get("ssl");
+        if (sslValue instanceof Boolean) {
+            cfg.sslProperties.enabled = (Boolean) sslValue;
+        }
+
+        if (sslValue instanceof Map) {
+            Map<String, Object> configSsl = (Map<String, Object>) sslValue;
+            if (configSsl.containsKey("enabled")) {
+                cfg.sslProperties.enabled = (Boolean) configSsl.get("enabled");
+            }
+
+            if (configSsl.containsKey("keyStore")) {
+                Map<String, Object> configKeyStore = (Map<String, Object>) configSsl.get("keyStore");
+                cfg.sslProperties.keyStoreProperties = getKeyStoreProperties(configKeyStore);
+            }
+
+            if (configSsl.containsKey("trustStore")) {
+                Map<String, Object> configKeyStore = (Map<String, Object>) configSsl.get("trustStore");
+                cfg.sslProperties.trustStoreProperties = getKeyStoreProperties(configKeyStore);
+            }
+
+            if (configSsl.containsKey("protocols")) {
+                Object protocolsValue = configSsl.get("protocols");
+                if (protocolsValue instanceof List) {
+                    cfg.sslProperties.protocols = ((List<Object>) protocolsValue)
+                            .stream().map(Object::toString).map(String::trim).collect(Collectors.toList());
+                } else {
+                    cfg.sslProperties.protocols = Stream.of(((String) protocolsValue).split(","))
+                            .map(String::trim)
+                            .collect(Collectors.toList());
+                }
+            }
+
+            if (configSsl.containsKey("ciphers")) {
+                Object ciphersValue = configSsl.get("ciphers");
+                if (ciphersValue instanceof List) {
+                    cfg.sslProperties.ciphers = ((List<Object>) ciphersValue)
+                            .stream().map(Object::toString).map(String::trim).collect(Collectors.toList());
+                } else {
+                    cfg.sslProperties.ciphers = Stream.of(((String) ciphersValue).split(","))
+                            .map(String::trim)
+                            .collect(Collectors.toList());
+                }
+            }
+        }
+
+        if (yamlConfig.containsKey("lowercaseOutputName")) {
+            cfg.lowercaseOutputName = (Boolean) yamlConfig.get("lowercaseOutputName");
+        }
+
+        if (yamlConfig.containsKey("lowercaseOutputLabelNames")) {
+            cfg.lowercaseOutputLabelNames = (Boolean) yamlConfig.get("lowercaseOutputLabelNames");
+        }
+
+        if (yamlConfig.containsKey("inferCounterTypeFromName")) {
+            cfg.inferCounterTypeFromName = (Boolean) yamlConfig.get("inferCounterTypeFromName");
+        }
+
+        // Default to includeObjectNames, but fall back to whitelistObjectNames for backward
+        // compatibility
+        if (yamlConfig.containsKey("includeObjectNames")) {
+            List<Object> names = (List<Object>) yamlConfig.get("includeObjectNames");
+            for (Object name : names) {
+                cfg.includeObjectNames.add(new ObjectName((String) name));
+            }
+        } else if (yamlConfig.containsKey("whitelistObjectNames")) {
+            List<Object> names = (List<Object>) yamlConfig.get("whitelistObjectNames");
+            for (Object name : names) {
+                cfg.includeObjectNames.add(new ObjectName((String) name));
+            }
+        } else {
+            cfg.includeObjectNames.add(null);
+        }
+
+        // Default to excludeObjectNames, but fall back to blacklistObjectNames for backward
+        // compatibility
+        if (yamlConfig.containsKey("excludeObjectNames")) {
+            List<Object> names = (List<Object>) yamlConfig.get("excludeObjectNames");
+            for (Object name : names) {
+                cfg.excludeObjectNames.add(new ObjectName((String) name));
+            }
+        } else if (yamlConfig.containsKey("blacklistObjectNames")) {
+            List<Object> names = (List<Object>) yamlConfig.get("blacklistObjectNames");
+            for (Object name : names) {
+                cfg.excludeObjectNames.add(new ObjectName((String) name));
+            }
+        }
+
+        if (yamlConfig.containsKey("excludeJvmMetrics")) {
+            Boolean excludeJvmMetrics = (Boolean) yamlConfig.get("excludeJvmMetrics");
+            cfg.excludeJvmMetrics = excludeJvmMetrics != null && excludeJvmMetrics;
+        }
+
+        if (yamlConfig.containsKey("metricCustomizers")) {
+            List<Map<String, Object>> metricCustomizersYaml =
+                    (List<Map<String, Object>>) yamlConfig.get("metricCustomizers");
+            if (metricCustomizersYaml != null) {
+                for (Map<String, Object> metricCustomizerYaml : metricCustomizersYaml) {
+                    Map<String, Object> mbeanFilterYaml = (Map<String, Object>) metricCustomizerYaml.get("mbeanFilter");
+                    if (mbeanFilterYaml == null) {
+                        throw new IllegalArgumentException(
+                                "Must provide mbeanFilter, if metricCustomizers is given: " + metricCustomizersYaml);
+                    }
+                    MBeanFilter mbeanFilter = new MBeanFilter();
+                    mbeanFilter.domain = (String) mbeanFilterYaml.get("domain");
+                    if (mbeanFilter.domain == null) {
+                        throw new IllegalArgumentException(
+                                "Must provide domain, if metricCustomizers is given: " + metricCustomizersYaml);
+                    }
+                    mbeanFilter.properties =
+                            (Map<String, String>) mbeanFilterYaml.getOrDefault("properties", new HashMap<>());
+
+                    List<String> attributesAsLabelsYaml = (List<String>) metricCustomizerYaml.get("attributesAsLabels");
+                    List<Map<String, Object>> extraMetricsYaml =
+                            (List<Map<String, Object>>) metricCustomizerYaml.get("extraMetrics");
+                    if (attributesAsLabelsYaml == null && extraMetricsYaml == null) {
+                        throw new IllegalArgumentException("Must provide attributesAsLabels or extraMetrics, if"
+                                + " metricCustomizers is given: "
+                                + metricCustomizersYaml);
+                    }
+                    MetricCustomizer metricCustomizer = new MetricCustomizer();
+                    metricCustomizer.mbeanFilter = mbeanFilter;
+                    metricCustomizer.attributesAsLabels = attributesAsLabelsYaml;
+
+                    if (extraMetricsYaml != null) {
+                        List<ExtraMetric> extraMetrics = new ArrayList<>();
+                        for (Map<String, Object> extraMetricYaml : extraMetricsYaml) {
+                            ExtraMetric extraMetric = new ExtraMetric();
+                            extraMetric.name = (String) extraMetricYaml.get("name");
+                            if (extraMetric.name == null) {
+                                throw new IllegalArgumentException(
+                                        "Must provide name, if extraMetric is given: " + extraMetricsYaml);
+                            }
+                            extraMetric.value = extraMetricYaml.get("value");
+                            if (extraMetric.value == null) {
+                                throw new IllegalArgumentException(
+                                        "Must provide value, if extraMetric is given: " + extraMetricsYaml);
+                            }
+                            extraMetric.description = (String) extraMetricYaml.get("description");
+                            extraMetrics.add(extraMetric);
+                        }
+                        metricCustomizer.extraMetrics = extraMetrics;
+                    }
+                    cfg.metricCustomizers.add(metricCustomizer);
+                }
+            } else {
+                throw new IllegalArgumentException("Must provide mbeanFilter, if metricCustomizers is given ");
+            }
+        }
+
+        if (yamlConfig.containsKey("rules")) {
+            List<Map<String, Object>> configRules = (List<Map<String, Object>>) yamlConfig.get("rules");
+            for (Map<String, Object> yamlRule : configRules) {
+                Rule rule = new Rule();
+                cfg.rules.add(rule);
+                if (yamlRule.containsKey("pattern")) {
+                    rule.pattern = Pattern.compile("^.*(?:" + yamlRule.get("pattern") + ").*$");
+                }
+                if (yamlRule.containsKey("name")) {
+                    rule.name = (String) yamlRule.get("name");
+                }
+                if (yamlRule.containsKey("value")) {
+                    rule.value = String.valueOf(yamlRule.get("value"));
+                }
+                if (yamlRule.containsKey("valueFactor")) {
+                    String valueFactor = String.valueOf(yamlRule.get("valueFactor"));
+                    try {
+                        rule.valueFactor = Double.valueOf(valueFactor);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("Invalid number provided for valueFactor", e);
+                    }
+                }
+                if (yamlRule.containsKey("attrNameSnakeCase")) {
+                    rule.attrNameSnakeCase = (Boolean) yamlRule.get("attrNameSnakeCase");
+                }
+                if (yamlRule.containsKey("cache")) {
+                    rule.cache = (Boolean) yamlRule.get("cache");
+                }
+                if (yamlRule.containsKey("type")) {
+                    String t = (String) yamlRule.get("type");
+                    // Gracefully handle switch to OM data model.
+                    if ("UNTYPED".equals(t)) {
+                        t = "UNKNOWN";
+                    }
+                    rule.type = t;
+                }
+                if (yamlRule.containsKey("help")) {
+                    rule.help = (String) yamlRule.get("help");
+                }
+                if (yamlRule.containsKey("labels")) {
+                    TreeMap<String, Object> labels = new TreeMap<>((Map<String, Object>) yamlRule.get("labels"));
+                    rule.labelNames = new ArrayList<>();
+                    rule.labelValues = new ArrayList<>();
+                    for (Map.Entry<String, Object> entry : labels.entrySet()) {
+                        rule.labelNames.add(entry.getKey());
+                        rule.labelValues.add((String) entry.getValue());
+                    }
+                }
+
+                // Validation.
+                if ((rule.labelNames != null || rule.help != null) && rule.name == null) {
+                    throw new IllegalArgumentException("Must provide name, if help or labels are given: " + yamlRule);
+                }
+                if (rule.name != null && rule.pattern == null) {
+                    throw new IllegalArgumentException("Must provide pattern, if name is given: " + yamlRule);
+                }
+            }
+        } else {
+            // Default to a single default rule.
+            cfg.rules.add(new Rule());
+        }
+
+        boolean hasCachedRules = false;
+        for (Rule rule : cfg.rules) {
+            hasCachedRules |= rule.cache;
+        }
+
+        // Avoid all costs related to maintaining the cache if there are no cached rules
+        if (hasCachedRules) {
+            cfg.rulesCache = new MatchedRulesCache();
+        }
+        cfg.objectNameAttributeFilter = ObjectNameAttributeFilter.create(yamlConfig);
+
+        return cfg;
+    }
+
+    private KeyStoreProperties getKeyStoreProperties(Map<String, Object> configKeyStore) {
+        KeyStoreProperties keyStoreProperties = new KeyStoreProperties();
+        if (configKeyStore.containsKey("filename")) {
+            keyStoreProperties.path = Paths.get((String) configKeyStore.get("filename"));
+        }
+        if (configKeyStore.containsKey("type")) {
+            keyStoreProperties.type = (String) configKeyStore.get("type");
+        }
+        if (configKeyStore.containsKey("password")) {
+            keyStoreProperties.password = ((String) configKeyStore.get("password")).toCharArray();
+        }
+        return keyStoreProperties;
+    }
+
+    /**
+     * Convert name to snake case and lower case.
+     *
+     * @param name the name
+     * @return the converted name
+     */
+    static String toSnakeAndLowerCase(String name) {
+        if (name == null || name.isEmpty()) {
+            return name;
+        }
+
+        // Fast path: if every character already has no lowercase mapping, the snake-case
+        // conversion would return the input unchanged, so avoid the StringBuilder allocation.
+        // This also covers title-case characters whose lowercase mapping differs from themselves.
+        if (isLowerCaseInvariant(name)) {
+            return name;
+        }
+
+        char firstChar = name.charAt(0);
+
+        boolean prevCharIsUpperCaseOrUnderscore = Character.isUpperCase(firstChar) || firstChar == '_';
+
+        StringBuilder stringBuilder = new StringBuilder(name.length()).append(Character.toLowerCase(firstChar));
+
+        for (int i = 1; i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean charIsUpperCase = Character.isUpperCase(c);
+
+            if (!prevCharIsUpperCaseOrUnderscore && charIsUpperCase) {
+                stringBuilder.append("_");
+            }
+
+            stringBuilder.append(Character.toLowerCase(c));
+            prevCharIsUpperCaseOrUnderscore = charIsUpperCase || c == '_';
+        }
+
+        return stringBuilder.toString();
+    }
+
+    /**
+     * Returns whether every character in {@code name} is unchanged by
+     * {@link Character#toLowerCase(char)}. When true, {@link #toSnakeAndLowerCase(String)} returns
+     * the input unchanged because no underscore would be inserted and no character would be
+     * lowercased.
+     *
+     * @param name the name to check, must not be {@code null}
+     * @return {@code true} if {@code toSnakeAndLowerCase(name)} would return {@code name} unchanged
+     */
+    private static boolean isLowerCaseInvariant(String name) {
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.toLowerCase(c) != c) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Convert the name to a "safe" name by changing invalid chars to underscore, and merging
+     * consecutive underscores.
+     *
+     * @param name the name
+     * @return the safe name
+     */
+    static String toSafeName(String name) {
+        if (name == null) {
+            return null;
+        }
+
+        // Fast path: an already-safe name is returned unchanged. This avoids allocating a
+        // StringBuilder and a new String for the common case of names that are already valid.
+        // The content is identical to the general path below.
+        if (isSafeName(name)) {
+            return name;
+        }
+
+        boolean prevCharIsUnderscore = false;
+        StringBuilder stringBuilder = new StringBuilder(name.length());
+
+        if (!name.isEmpty() && Character.isDigit(name.charAt(0))) {
+            // prevent a numeric prefix.
+            stringBuilder.append("_");
+        }
+
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean isUnsafeChar = !JmxCollector.isLegalCharacter(c);
+            if ((isUnsafeChar || c == '_')) {
+                if (!prevCharIsUnderscore) {
+                    stringBuilder.append("_");
+                    prevCharIsUnderscore = true;
+                }
+            } else {
+                stringBuilder.append(c);
+                prevCharIsUnderscore = false;
+            }
+        }
+
+        return stringBuilder.toString();
+    }
+
+    /**
+     * Returns whether {@link #toSafeName(String)} would return the input unchanged.
+     *
+     * <p>A name is already safe when it does not start with a digit, every character is a legal
+     * character, and it does not contain consecutive underscores (which the general path would
+     * collapse).
+     *
+     * @param name the name to check, must not be {@code null}
+     * @return {@code true} if {@code toSafeName(name)} would return {@code name} unchanged
+     */
+    private static boolean isSafeName(String name) {
+        if (name.isEmpty()) {
+            return true;
+        }
+
+        if (Character.isDigit(name.charAt(0))) {
+            return false;
+        }
+
+        char previous = 0;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (!isLegalCharacter(c)) {
+                return false;
+            }
+            if (c == '_' && previous == '_') {
+                return false;
+            }
+            previous = c;
+        }
+
+        return true;
+    }
+
+    private static boolean isLegalCharacter(char input) {
+        return ((input == ':')
+                || (input == '_')
+                || (input >= 'a' && input <= 'z')
+                || (input >= 'A' && input <= 'Z')
+                || (input >= '0' && input <= '9'));
+    }
+
+    static class Receiver implements JmxScraper.MBeanReceiver {
+
+        final List<MatchedRule> matchedRules = new ArrayList<>();
+
+        final Config config;
+        final MatchedRulesCache.StalenessTracker stalenessTracker;
+
+        private static final char SEP = '_';
+
+        Receiver(Config config, MatchedRulesCache.StalenessTracker stalenessTracker) {
+            this.config = config;
+            this.stalenessTracker = stalenessTracker;
+        }
+
+        // [] and () are special in regexes, so switch to <>.
+        private String angleBrackets(String s) {
+            if (s.length() < 2) {
+                return new StringBuilder(s.length() + 2)
+                        .append('<')
+                        .append(s)
+                        .append('>')
+                        .toString();
+            }
+            return new StringBuilder(s.length())
+                    .append('<')
+                    .append(s, 1, s.length() - 1)
+                    .append('>')
+                    .toString();
+        }
+
+        // Appends the contents of a map in the same format as AbstractMap.toString() minus the
+        // surrounding braces ("k=v, k2=v2"), without materializing the intermediate string.
+        static void appendMapContents(StringBuilder builder, LinkedHashMap<String, String> map) {
+            boolean first = true;
+            for (Map.Entry<String, String> entry : map.entrySet()) {
+                if (!first) {
+                    builder.append(", ");
+                }
+                first = false;
+                builder.append(entry.getKey()).append('=').append(entry.getValue());
+            }
+        }
+
+        // Appends the contents of a list in the same format as AbstractCollection.toString() minus
+        // the surrounding brackets ("a, b"), without materializing the intermediate string.
+        static void appendListContents(StringBuilder builder, List<String> list) {
+            boolean first = true;
+            for (String element : list) {
+                if (!first) {
+                    builder.append(", ");
+                }
+                first = false;
+                builder.append(element);
+            }
+        }
+
+        // Add the matched rule to the cached rules and tag it as not stale. The lookup key only
+        // references the caller's bean metadata, so a defensive copy is stored.
+        private void addToCache(final CacheKey cacheKey, final MatchedRule matchedRule) {
+            if (config.rulesCache != null && cacheKey != null) {
+                CacheKey storedKey = cacheKey.storedCopy();
+                config.rulesCache.put(storedKey, matchedRule);
+                stalenessTracker.markAsFresh(storedKey);
+            }
+        }
+
+        private MatchedRule defaultExport(
+                String matchName,
+                String domain,
+                LinkedHashMap<String, String> beanProperties,
+                List<String> attrKeys,
+                String attrName,
+                String help,
+                Double value,
+                double valueFactor,
+                String type,
+                Map<String, String> attributesAsLabelsWithValues) {
+            StringBuilder name = new StringBuilder();
+            name.append(domain);
+            if (!beanProperties.isEmpty()) {
+                name.append(SEP);
+                name.append(beanProperties.values().iterator().next());
+            }
+            for (String k : attrKeys) {
+                name.append(SEP);
+                name.append(k);
+            }
+            name.append(SEP);
+            name.append(attrName);
+            String fullname = toSafeName(name.toString());
+
+            if (config.lowercaseOutputName) {
+                fullname = fullname.toLowerCase();
+            }
+
+            if (config.inferCounterTypeFromName && fullname.endsWith("_total")) {
+                type = "COUNTER";
+            }
+
+            List<String> labelNames = new ArrayList<>();
+            List<String> labelValues = new ArrayList<>();
+            if (beanProperties.size() > 1) {
+                Iterator<Map.Entry<String, String>> iter =
+                        beanProperties.entrySet().iterator();
+                // Skip the first one, it's been used in the name.
+                iter.next();
+                while (iter.hasNext()) {
+                    Map.Entry<String, String> entry = iter.next();
+                    String labelName = toSafeName(entry.getKey());
+                    if (config.lowercaseOutputLabelNames) {
+                        labelName = labelName.toLowerCase();
+                    }
+                    labelNames.add(labelName);
+                    labelValues.add(entry.getValue());
+                }
+            }
+            addAttributesAsLabelsWithValuesToLabels(config, attributesAsLabelsWithValues, labelNames, labelValues);
+
+            return new MatchedRule(fullname, matchName, type, help, labelNames, labelValues, value, valueFactor);
+        }
+
+        public void recordBean(
+                String domain,
+                LinkedHashMap<String, String> beanProperties,
+                Map<String, String> attributesAsLabelsWithValues,
+                List<String> attrKeys,
+                String attrName,
+                String attrType,
+                String attrDescription,
+                Object beanValue) {
+
+            MatchedRule matchedRule = MatchedRule.unmatched();
+
+            CacheKey cacheKey = null;
+            MatchedRule cachedRule = null;
+
+            if (config.rulesCache != null) {
+                // Probe with a non-copying lookup key. On a hit, mark the canonical stored key
+                // fresh, so the steady-state cached path avoids constructing a new key entirely.
+                cacheKey = CacheKey.lookup(domain, beanProperties, attrKeys, attrName);
+                MatchedRulesCache.Entry cachedEntry = config.rulesCache.getEntry(cacheKey);
+                if (cachedEntry != null) {
+                    cachedRule = cachedEntry.rule;
+                    stalenessTracker.markAsFresh(cachedEntry.key);
+                    matchedRule = cachedRule;
+                }
+            }
+
+            if (matchedRule.isUnmatched()) {
+                // Only the rule-matching path needs the string forms of the bean metadata. The
+                // steady-state cached path skips these allocations entirely. Build the bracketed
+                // name directly instead of materializing beanProperties.toString()/attrKeys.toString()
+                // and then rewriting them through angleBrackets().
+                StringBuilder beanNameBuilder =
+                        new StringBuilder(domain.length() + beanProperties.size() * 16 + attrKeys.size() * 16 + 8);
+                beanNameBuilder.append(domain).append('<');
+                appendMapContents(beanNameBuilder, beanProperties);
+                beanNameBuilder.append("><");
+                appendListContents(beanNameBuilder, attrKeys);
+                beanNameBuilder.append('>');
+                String beanName = beanNameBuilder.toString();
+
+                // Build the HELP string from the bean metadata.
+                String beanNameProp = beanProperties.get("name");
+                String beanTypeProp = beanProperties.get("type");
+                String help = new StringBuilder(domain.length()
+                                + 6
+                                + (beanNameProp != null ? beanNameProp.length() : 4)
+                                + 6
+                                + (beanTypeProp != null ? beanTypeProp.length() : 4)
+                                + 11
+                                + attrName.length())
+                        .append(domain)
+                        .append(":name=")
+                        .append(beanNameProp)
+                        .append(",type=")
+                        .append(beanTypeProp)
+                        .append(",attribute=")
+                        .append(attrName)
+                        .toString();
+                // Add the attrDescription to the HELP if it exists and is useful.
+                if (attrDescription != null && !attrDescription.equals(attrName)) {
+                    help = new StringBuilder(attrDescription.length() + 1 + help.length())
+                            .append(attrDescription)
+                            .append(' ')
+                            .append(help)
+                            .toString();
+                }
+
+                for (Rule rule : config.rules) {
+                    // If we cache that rule, and we found a cache entry for this bean/attribute,
+                    // then what's left to do is to check all uncached rules
+                    if (rule.cache && cachedRule != null) {
+                        continue;
+                    }
+
+                    // Rules with bean values cannot be properly cached (only the value from the
+                    // first
+                    // scrape will be cached).
+                    // If caching for the rule is enabled, replace the value with a dummy <cache> to
+                    // avoid caching different values at different times.
+                    Object matchBeanValue = rule.cache ? "<cache>" : beanValue;
+
+                    String attributeName;
+                    if (rule.attrNameSnakeCase) {
+                        attributeName = toSnakeAndLowerCase(attrName);
+                    } else {
+                        attributeName = attrName;
+                    }
+
+                    StringBuilder matchNameBuilder = new StringBuilder(
+                                    beanName.length() + attributeName.length() + 2 + 16)
+                            .append(beanName)
+                            .append(attributeName)
+                            .append(": ");
+                    if (rule.pattern != null) {
+                        // Only a pattern can read the value from matchName. For the pattern-less
+                        // default rule, matchName is used solely to derive _objectname when labels
+                        // collide, and default-export labels cannot collide, so the value is not
+                        // appended. This avoids converting every bean value to a String.
+                        matchNameBuilder.append(matchBeanValue);
+                    }
+                    String matchName = matchNameBuilder.toString();
+
+                    Matcher matcher = null;
+                    if (rule.pattern != null) {
+                        matcher = rule.pattern.matcher(matchName);
+                        if (!matcher.matches()) {
+                            continue;
+                        }
+                    }
+
+                    Double value = null;
+                    if (rule.value != null && !rule.value.isEmpty()) {
+                        String val = matcher.replaceAll(rule.value);
+                        try {
+                            value = Double.valueOf(val);
+                        } catch (NumberFormatException e) {
+                            LOGGER.trace(
+                                    "Unable to parse configured value '%s' to number for bean:" + " %s%s: %s",
+                                    val, beanName, attrName, beanValue);
+                            return;
+                        }
+                    }
+
+                    // If there's no name provided, use default export format.
+                    if (rule.name == null) {
+                        matchedRule = defaultExport(
+                                matchName,
+                                domain,
+                                beanProperties,
+                                attrKeys,
+                                attributeName,
+                                help,
+                                value,
+                                rule.valueFactor,
+                                rule.type,
+                                attributesAsLabelsWithValues);
+                        if (rule.cache) {
+                            addToCache(cacheKey, matchedRule);
+                        }
+                        break;
+                    }
+
+                    // Matcher is set below here due to validation in the constructor.
+                    String name = toSafeName(matcher.replaceAll(rule.name));
+                    if (name.isEmpty()) {
+                        return;
+                    }
+                    if (config.lowercaseOutputName) {
+                        name = name.toLowerCase();
+                    }
+
+                    String type = rule.type;
+                    if (config.inferCounterTypeFromName && name.endsWith("_total")) {
+                        type = "COUNTER";
+                    }
+
+                    // Set the help.
+                    if (rule.help != null) {
+                        help = matcher.replaceAll(rule.help);
+                    }
+
+                    // Set the labels.
+                    ArrayList<String> labelNames = new ArrayList<>();
+                    ArrayList<String> labelValues = new ArrayList<>();
+                    addAttributesAsLabelsWithValuesToLabels(
+                            config, attributesAsLabelsWithValues, labelNames, labelValues);
+                    if (rule.labelNames != null) {
+                        for (int i = 0; i < rule.labelNames.size(); i++) {
+                            final String unsafeLabelName = rule.labelNames.get(i);
+                            final String labelValReplacement = rule.labelValues.get(i);
+                            try {
+                                String labelName = toSafeName(matcher.replaceAll(unsafeLabelName));
+                                String labelValue = matcher.replaceAll(labelValReplacement);
+                                if (config.lowercaseOutputLabelNames) {
+                                    labelName = labelName.toLowerCase();
+                                }
+                                if (!labelName.isEmpty() && !labelValue.isEmpty()) {
+                                    labelNames.add(labelName);
+                                    labelValues.add(labelValue);
+                                }
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        format(
+                                                "Matcher '%s' unable to use: '%s' value: '%s'",
+                                                matcher, unsafeLabelName, labelValReplacement),
+                                        e);
+                            }
+                        }
+                    }
+
+                    matchedRule = new MatchedRule(
+                            name, matchName, type, help, labelNames, labelValues, value, rule.valueFactor);
+                    if (rule.cache) {
+                        addToCache(cacheKey, matchedRule);
+                    }
+                    break;
+                }
+            }
+
+            if (matchedRule.isUnmatched()) {
+                addToCache(cacheKey, matchedRule);
+                return;
+            }
+
+            Number value;
+            if (matchedRule.value != null) {
+                beanValue = matchedRule.value;
+            }
+
+            if (beanValue instanceof Number) {
+                value = ((Number) beanValue).doubleValue() * matchedRule.valueFactor;
+            } else if (beanValue instanceof Boolean) {
+                value = (Boolean) beanValue ? 1 : 0;
+            } else {
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace(
+                            "Ignoring unsupported bean: %s%s%s%s: %s ",
+                            domain,
+                            angleBrackets(beanProperties.toString()),
+                            angleBrackets(attrKeys.toString()),
+                            attrName,
+                            beanValue);
+                }
+                return;
+            }
+
+            // Add to samples.
+            if (LOGGER.isTraceEnabled()) {
+                LOGGER.trace("add metric sample: %s %s %s", matchedRule.name, matchedRule.labels, value.doubleValue());
+            }
+
+            matchedRules.add(matchedRule.withValue(value.doubleValue()));
+        }
+    }
+
+    private static void addAttributesAsLabelsWithValuesToLabels(
+            Config config,
+            Map<String, String> attributesAsLabelsWithValues,
+            List<String> labelNames,
+            List<String> labelValues) {
+        attributesAsLabelsWithValues.forEach((attributeAsLabelName, attributeValue) -> {
+            String labelName = toSafeName(attributeAsLabelName);
+            if (config.lowercaseOutputLabelNames) {
+                labelName = labelName.toLowerCase();
+            }
+            labelNames.add(labelName);
+            labelValues.add(attributeValue);
+        });
+    }
+
+    @Override
+    public MetricSnapshots collect() {
+        // Take a reference to the current config and collect with this one
+        // (to avoid race conditions in case another thread reloads the config in the meantime)
+        Config config = getLatestConfig();
+        Integer timeout = config.scrapeTimeoutSeconds;
+
+        Future<MetricSnapshots> future;
+        boolean ownsScrape = false;
+
+        if (timeout != null) {
+            // Single-flight: join an in-flight scrape, or start a new one.
+            while (true) {
+                Future<MetricSnapshots> existing = inFlightScrape.get();
+                if (existing != null) {
+                    future = existing;
+                    break;
+                }
+                FutureTask<MetricSnapshots> task = new FutureTask<>(() -> doCollect(config));
+                if (inFlightScrape.compareAndSet(null, task)) {
+                    scrapeExecutor.execute(task);
+                    future = task;
+                    ownsScrape = true;
+                    break;
+                }
+            }
+        } else {
+            // No timeout is configured, so run each scrape independently. Combined with this
+            // collector's thread pool this allows concurrent collection.
+            future = scrapeExecutor.submit(() -> doCollect(config));
+        }
+
+        try {
+            MetricSnapshots result;
+            if (timeout != null) {
+                result = future.get(timeout, TimeUnit.SECONDS);
+            } else {
+                result = future.get();
+            }
+            lastGoodSnapshots = result;
+            return result;
+        } catch (TimeoutException e) {
+            scrapeTimeoutCounter.inc();
+            return lastGoodSnapshots;
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            jmxScrapeError.set(1);
+            return lastGoodSnapshots;
+        } catch (Exception e) {
+            jmxScrapeError.set(1);
+            return lastGoodSnapshots;
+        } finally {
+            if (ownsScrape) {
+                inFlightScrape.compareAndSet(future, null);
+            }
+        }
+    }
+
+    /**
+     * Performs the actual JMX scrape.
+     *
+     * @param config the configuration to use for this scrape
+     * @return the collected metric snapshots
+     */
+    private MetricSnapshots doCollect(Config config) {
+        MatchedRulesCache.StalenessTracker stalenessTracker =
+                config.rulesCache != null ? new MatchedRulesCache.StalenessTracker() : null;
+
+        Receiver receiver = new Receiver(config, stalenessTracker);
+
+        JmxScraper scraper = new JmxScraper(
+                config.jmxUrl,
+                config.username,
+                config.password,
+                config.sslProperties,
+                config.includeObjectNames,
+                config.excludeObjectNames,
+                config.excludeJvmMetrics,
+                config.objectNameAttributeFilter,
+                config.metricCustomizers,
+                receiver,
+                jmxMBeanPropertyCache);
+
+        long start = System.currentTimeMillis();
+        double error = 1;
+        String errorMsg = "";
+
+        if (mode != Mode.AGENT
+                && (config.startDelaySeconds > 0)
+                && ((start - createTimeMillis) / 1000L < config.startDelaySeconds)) {
+            throw new IllegalStateException("JMXCollector waiting for startDelaySeconds");
+        }
+        try {
+            scraper.doScrape();
+            error = 0;
+        } catch (IOException | SecurityException e) {
+            errorMsg = e.getMessage();
+        } catch (Exception e) {
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            errorMsg = sw.toString();
+        }
+
+        if (error == 1) {
+            LOGGER.error("JMX scrape failed: %s", errorMsg);
+        }
+
+        if (config.rulesCache != null) {
+            config.rulesCache.evictStaleEntries(stalenessTracker);
+        }
+
+        jmxScrapeDurationSeconds.set((System.currentTimeMillis() - start) / 1000.0);
+        jmxScrapeError.set(error);
+        jmxScrapeCachedBeans.set(stalenessTracker != null ? stalenessTracker.freshCount() : 0);
+
+        return MatchedRuleToMetricSnapshotsConverter.convert(receiver.matchedRules);
+    }
+}

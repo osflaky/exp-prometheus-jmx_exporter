@@ -1,0 +1,35 @@
+.DS_Store
+# editor files
+*.swp
+*.iml
+.idea
+
+# compilation objects
+target/
+.project
+.settings/
+.classpath
+**/.flattened-pom.xml
+dependency-reduced-pom.xml
+pom.xml.versionsBackup
+integration_test_suite/integration_tests/src/test/resources/common/**.jar
+quick-test.log
+smoke-test.log
+regression-test.log
+RELEASE
+__pycache__/
+.pi/plans/
+.pi/specs/
+
+# documentation site generated files
+website/node_modules/
+website/.docusaurus/
+website/build/
+website/.cache/
+website/npm-debug.log*
+website/yarn-debug.log*
+website/yarn-error.log*
+website/pnpm-debug.log*
+website/.env.local
+website/.env.*.local
+website/*.tsbuildinfo

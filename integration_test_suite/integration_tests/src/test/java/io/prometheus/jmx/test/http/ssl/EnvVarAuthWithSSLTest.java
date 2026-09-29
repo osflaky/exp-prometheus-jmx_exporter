@@ -1,0 +1,277 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx.test.http.ssl;
+
+import static io.prometheus.jmx.test.support.metrics.MetricsAssertions.assertMetrics;
+import static io.prometheus.jmx.test.support.metrics.MetricsAssertions.assertMetricsContentType;
+import static io.prometheus.jmx.test.support.metrics.MetricsParser.parseMap;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.paramixel.api.Context.withInstance;
+import static org.paramixel.api.action.Instance.instance;
+import static org.paramixel.api.action.Scope.scope;
+import static org.paramixel.api.action.Sequential.sequential;
+import static org.paramixel.api.action.Step.step;
+
+import io.prometheus.jmx.test.support.environment.JmxExporterPath;
+import io.prometheus.jmx.test.support.environment.JmxExporterTestEnvironment;
+import io.prometheus.jmx.test.support.http.HttpClient;
+import io.prometheus.jmx.test.support.http.HttpHeader;
+import io.prometheus.jmx.test.support.http.HttpRequest;
+import io.prometheus.jmx.test.support.http.HttpResponse;
+import io.prometheus.jmx.test.support.metrics.Metric;
+import io.prometheus.jmx.test.support.metrics.MetricsContentType;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.altcontainers.api.Network;
+import org.paramixel.api.Paramixel;
+import org.paramixel.api.Runner;
+import org.paramixel.api.action.Action;
+import org.paramixel.api.action.Each;
+
+public class EnvVarAuthWithSSLTest {
+
+    private static final String BASE_URL = "https://localhost";
+
+    private static final String VALID_USERNAME = "Prometheus";
+
+    private static final String VALID_PASSWORD = "secret";
+
+    private static final String[] TEST_USERNAMES = new String[] {VALID_USERNAME, "prometheus", "bad", "", null};
+
+    private static final String[] TEST_PASSWORDS = new String[] {VALID_PASSWORD, "Secret", "bad", "", null};
+
+    private final JmxExporterTestEnvironment environment;
+
+    private Network network;
+
+    private EnvVarAuthWithSSLTest(JmxExporterTestEnvironment environment) {
+        this.environment = environment;
+    }
+
+    public static void main(String[] args) throws Throwable {
+        Runner.defaultRunner().runAndExit(factory());
+    }
+
+    @Paramixel.Factory
+    public static Action factory() throws Throwable {
+        var environments = JmxExporterTestEnvironment.createTestEnvironments(EnvVarAuthWithSSLTest.class).stream()
+                .filter(environment -> !environment.getJavaDockerImage().contains("eclipse-temurin:8-alpine"))
+                .map(environment -> environment.setBaseUrl(BASE_URL))
+                .collect(Collectors.toList());
+
+        return Each.parallel(
+                        EnvVarAuthWithSSLTest.class.getName(),
+                        environments,
+                        environment -> instance(environment.name(), () -> new EnvVarAuthWithSSLTest(environment))
+                                .body(scope("scenario")
+                                        .before(step(
+                                                "setUp()",
+                                                withInstance(
+                                                        EnvVarAuthWithSSLTest.class, EnvVarAuthWithSSLTest::setUp)))
+                                        .body(sequential("tests")
+                                                .child(step(
+                                                        "testHealthy()",
+                                                        withInstance(
+                                                                EnvVarAuthWithSSLTest.class,
+                                                                EnvVarAuthWithSSLTest::testHealthy)))
+                                                .child(step(
+                                                        "testDefaultTextMetrics()",
+                                                        withInstance(
+                                                                EnvVarAuthWithSSLTest.class,
+                                                                EnvVarAuthWithSSLTest::testDefaultTextMetrics)))
+                                                .child(step(
+                                                        "testOpenMetricsTextMetrics()",
+                                                        withInstance(
+                                                                EnvVarAuthWithSSLTest.class,
+                                                                EnvVarAuthWithSSLTest::testOpenMetricsTextMetrics)))
+                                                .child(step(
+                                                        "testPrometheusTextMetrics()",
+                                                        withInstance(
+                                                                EnvVarAuthWithSSLTest.class,
+                                                                EnvVarAuthWithSSLTest::testPrometheusTextMetrics)))
+                                                .child(step(
+                                                        "testPrometheusProtobufMetrics()",
+                                                        withInstance(
+                                                                EnvVarAuthWithSSLTest.class,
+                                                                EnvVarAuthWithSSLTest::testPrometheusProtobufMetrics))))
+                                        .after(step(
+                                                "tearDown()",
+                                                withInstance(
+                                                        EnvVarAuthWithSSLTest.class,
+                                                        EnvVarAuthWithSSLTest::tearDown)))))
+                .build();
+    }
+
+    public void setUp() throws Throwable {
+        network = Network.create();
+        environment.initialize(network);
+    }
+
+    public void testHealthy() throws IOException {
+        String url = environment.getUrl(JmxExporterPath.HEALTHY);
+
+        for (String username : TEST_USERNAMES) {
+            for (String password : TEST_PASSWORDS) {
+                int expectedStatusCode = 401;
+
+                if (VALID_USERNAME.equals(username) && VALID_PASSWORD.equals(password)) {
+                    expectedStatusCode = 200;
+                }
+
+                HttpRequest httpRequest = HttpRequest.builder()
+                        .url(url)
+                        .basicAuthentication(username, password)
+                        .build();
+
+                HttpResponse httpResponse = HttpClient.sendRequest(httpRequest);
+
+                assertThat(httpResponse.statusCode()).isEqualTo(expectedStatusCode);
+            }
+        }
+    }
+
+    public void testDefaultTextMetrics() throws IOException {
+        String url = environment.getUrl(JmxExporterPath.METRICS);
+
+        for (String username : TEST_USERNAMES) {
+            for (String password : TEST_PASSWORDS) {
+                int expectedStatusCode = 401;
+
+                if (VALID_USERNAME.equals(username) && VALID_PASSWORD.equals(password)) {
+                    expectedStatusCode = 200;
+                }
+
+                HttpRequest httpRequest = HttpRequest.builder()
+                        .url(url)
+                        .basicAuthentication(username, password)
+                        .build();
+
+                HttpResponse httpResponse = HttpClient.sendRequest(httpRequest);
+
+                if (expectedStatusCode == 401) {
+                    assertThat(httpResponse.statusCode()).isEqualTo(401);
+                } else {
+                    assertMetricsResponse(httpResponse, MetricsContentType.DEFAULT);
+                }
+            }
+        }
+    }
+
+    public void testOpenMetricsTextMetrics() throws IOException {
+        String url = environment.getUrl(JmxExporterPath.METRICS);
+
+        for (String username : TEST_USERNAMES) {
+            for (String password : TEST_PASSWORDS) {
+                int expectedStatusCode = 401;
+
+                if (VALID_USERNAME.equals(username) && VALID_PASSWORD.equals(password)) {
+                    expectedStatusCode = 200;
+                }
+
+                HttpRequest httpRequest = HttpRequest.builder()
+                        .url(url)
+                        .basicAuthentication(username, password)
+                        .header(HttpHeader.ACCEPT, MetricsContentType.OPEN_METRICS_TEXT_METRICS.toString())
+                        .build();
+
+                HttpResponse httpResponse = HttpClient.sendRequest(httpRequest);
+
+                if (expectedStatusCode == 401) {
+                    assertThat(httpResponse.statusCode()).isEqualTo(401);
+                } else {
+                    assertMetricsResponse(httpResponse, MetricsContentType.OPEN_METRICS_TEXT_METRICS);
+                }
+            }
+        }
+    }
+
+    public void testPrometheusTextMetrics() throws IOException {
+        String url = environment.getUrl(JmxExporterPath.METRICS);
+
+        for (String username : TEST_USERNAMES) {
+            for (String password : TEST_PASSWORDS) {
+                int expectedStatusCode = 401;
+
+                if (VALID_USERNAME.equals(username) && VALID_PASSWORD.equals(password)) {
+                    expectedStatusCode = 200;
+                }
+
+                HttpRequest httpRequest = HttpRequest.builder()
+                        .url(url)
+                        .basicAuthentication(username, password)
+                        .header(HttpHeader.ACCEPT, MetricsContentType.PROMETHEUS_TEXT_METRICS.toString())
+                        .build();
+
+                HttpResponse httpResponse = HttpClient.sendRequest(httpRequest);
+
+                if (expectedStatusCode == 401) {
+                    assertThat(httpResponse.statusCode()).isEqualTo(401);
+                } else {
+                    assertMetricsResponse(httpResponse, MetricsContentType.PROMETHEUS_TEXT_METRICS);
+                }
+            }
+        }
+    }
+
+    public void testPrometheusProtobufMetrics() throws IOException {
+        String url = environment.getUrl(JmxExporterPath.METRICS);
+
+        for (String username : TEST_USERNAMES) {
+            for (String password : TEST_PASSWORDS) {
+                int expectedStatusCode = 401;
+
+                if (VALID_USERNAME.equals(username) && VALID_PASSWORD.equals(password)) {
+                    expectedStatusCode = 200;
+                }
+
+                HttpRequest httpRequest = HttpRequest.builder()
+                        .url(url)
+                        .basicAuthentication(username, password)
+                        .header(HttpHeader.ACCEPT, MetricsContentType.PROMETHEUS_PROTOBUF_METRICS.toString())
+                        .build();
+
+                HttpResponse httpResponse = HttpClient.sendRequest(httpRequest);
+
+                if (expectedStatusCode == 401) {
+                    assertThat(httpResponse.statusCode()).isEqualTo(401);
+                } else {
+                    assertMetricsResponse(httpResponse, MetricsContentType.PROMETHEUS_PROTOBUF_METRICS);
+                }
+            }
+        }
+    }
+
+    public void tearDown() throws Throwable {
+        try {
+            environment.close();
+        } finally {
+            Network.close(network);
+        }
+    }
+
+    private void assertMetricsResponse(HttpResponse httpResponse, MetricsContentType metricsContentType) {
+        assertMetricsContentType(httpResponse, metricsContentType);
+
+        Map<String, Collection<Metric>> metrics = parseMap(httpResponse);
+        String mode = environment.getJmxExporterMode().name();
+        String javaDockerImage = environment.getJavaDockerImage();
+
+        assertMetrics(EnvVarAuthWithSSLTest.class, javaDockerImage, mode, metrics);
+    }
+}

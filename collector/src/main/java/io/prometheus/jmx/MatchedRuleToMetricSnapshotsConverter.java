@@ -1,0 +1,160 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx;
+
+import io.prometheus.jmx.logger.Logger;
+import io.prometheus.jmx.logger.LoggerFactory;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot;
+import io.prometheus.metrics.model.snapshots.GaugeSnapshot;
+import io.prometheus.metrics.model.snapshots.Labels;
+import io.prometheus.metrics.model.snapshots.MetricSnapshot;
+import io.prometheus.metrics.model.snapshots.MetricSnapshots;
+import io.prometheus.metrics.model.snapshots.UnknownSnapshot;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Class to implement MatchedRuleToMetricSnapshotsConverter
+ */
+public class MatchedRuleToMetricSnapshotsConverter {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(MatchedRuleToMetricSnapshotsConverter.class);
+
+    private static final String OBJECTNAME = "_objectname";
+
+    private static String getDomainName(String matchName) {
+        int lastColon = matchName.lastIndexOf(":");
+        if (lastColon <= 0) {
+            return matchName;
+        }
+        return matchName.substring(0, lastColon);
+    }
+
+    /**
+     * Constructor
+     */
+    public MatchedRuleToMetricSnapshotsConverter() {
+        // Intentionally empty
+    }
+
+    /**
+     * Method to convert a List of MatchedRules to MetricSnapshots
+     *
+     * @param matchedRules matchedRules
+     * @return a MetricSnapshots
+     */
+    public static MetricSnapshots convert(List<MatchedRule> matchedRules) {
+        Map<String, List<MatchedRule>> rulesByPrometheusMetricName = new HashMap<>();
+
+        for (MatchedRule matchedRule : matchedRules) {
+            List<MatchedRule> matchedRulesWithSameName =
+                    rulesByPrometheusMetricName.computeIfAbsent(matchedRule.name, name -> new ArrayList<>());
+            matchedRulesWithSameName.add(matchedRule);
+        }
+
+        if (LOGGER.isTraceEnabled()) {
+            rulesByPrometheusMetricName
+                    .values()
+                    .forEach(matchedRules1 ->
+                            matchedRules1.forEach(matchedRule -> LOGGER.trace("matchedRule %s", matchedRule)));
+        }
+
+        MetricSnapshots.Builder result = MetricSnapshots.builder();
+        for (List<MatchedRule> rulesWithSameName : rulesByPrometheusMetricName.values()) {
+            result.metricSnapshot(convertRulesWithSameName(rulesWithSameName));
+        }
+        return result.build();
+    }
+
+    private static MetricSnapshot convertRulesWithSameName(List<MatchedRule> rulesWithSameName) {
+        boolean labelsUnique = isLabelsUnique(rulesWithSameName);
+        MatchedRule firstRule = rulesWithSameName.get(0);
+        switch (getType(rulesWithSameName)) {
+            case "COUNTER":
+                CounterSnapshot.Builder counterBuilder =
+                        CounterSnapshot.builder().name(firstRule.name).help(firstRule.help);
+                for (MatchedRule rule : rulesWithSameName) {
+                    Labels labels = rule.labels;
+                    if (!labelsUnique) {
+                        labels = labels.merge(Labels.of(OBJECTNAME, getDomainName(rule.matchName)));
+                    }
+                    counterBuilder.dataPoint(CounterSnapshot.CounterDataPointSnapshot.builder()
+                            .labels(labels)
+                            .value(rule.value)
+                            .build());
+                }
+                return counterBuilder.build();
+            case "GAUGE":
+                GaugeSnapshot.Builder gaugeBuilder =
+                        GaugeSnapshot.builder().name(firstRule.name).help(firstRule.help);
+                for (MatchedRule rule : rulesWithSameName) {
+                    Labels labels = rule.labels;
+                    if (!labelsUnique) {
+                        labels = labels.merge(Labels.of(OBJECTNAME, getDomainName(rule.matchName)));
+                    }
+                    gaugeBuilder.dataPoint(GaugeSnapshot.GaugeDataPointSnapshot.builder()
+                            .labels(labels)
+                            .value(rule.value)
+                            .build());
+                }
+                return gaugeBuilder.build();
+            default:
+                UnknownSnapshot.Builder unknownBuilder =
+                        UnknownSnapshot.builder().name(firstRule.name).help(firstRule.help);
+                for (MatchedRule rule : rulesWithSameName) {
+                    Labels labels = rule.labels;
+                    if (!labelsUnique) {
+                        labels = labels.merge(Labels.of(OBJECTNAME, getDomainName(rule.matchName)));
+                    }
+                    unknownBuilder.dataPoint(UnknownSnapshot.UnknownDataPointSnapshot.builder()
+                            .labels(labels)
+                            .value(rule.value)
+                            .build());
+                }
+                return unknownBuilder.build();
+        }
+    }
+
+    /**
+     * If all rules have the same type, that type is returned. Otherwise, "UNKNOWN" is returned.
+     */
+    private static String getType(List<MatchedRule> rulesWithSameName) {
+        String type = rulesWithSameName.get(0).type;
+        for (int i = 1; i < rulesWithSameName.size(); i++) {
+            if (!java.util.Objects.equals(type, rulesWithSameName.get(i).type)) {
+                return "UNKNOWN";
+            }
+        }
+        return type;
+    }
+
+    private static boolean isLabelsUnique(List<MatchedRule> rulesWithSameName) {
+        Set<Labels> labelsSet = new HashSet<>(rulesWithSameName.size());
+        for (MatchedRule matchedRule : rulesWithSameName) {
+            Labels labels = matchedRule.labels;
+            if (labelsSet.contains(labels)) {
+                return false;
+            }
+            labelsSet.add(labels);
+        }
+        return true;
+    }
+}

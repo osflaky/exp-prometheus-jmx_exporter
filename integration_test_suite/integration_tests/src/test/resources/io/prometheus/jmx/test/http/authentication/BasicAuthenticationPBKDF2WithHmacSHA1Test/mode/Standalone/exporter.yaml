@@ -1,0 +1,10 @@
+httpServer:
+  authentication:
+    basic:
+      username: Prometheus
+      algorithm: PBKDF2WithHmacSHA1
+      salt: 98LeBWIjca
+      passwordHash: 26:40:93:17:BB:A0:82:68:1E:67:46:61:9F:02:1F:EC
+hostPort: application:9999
+rules:
+  - pattern: ".*"

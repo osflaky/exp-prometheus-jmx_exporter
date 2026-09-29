@@ -1,0 +1,49 @@
+/*
+ * Copyright (C) The Prometheus jmx_exporter Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.prometheus.jmx.test.support.filter;
+
+import io.prometheus.jmx.test.support.environment.JmxExporterTestEnvironment;
+import java.util.Set;
+import java.util.function.Predicate;
+
+/**
+ * Filters JMX exporter test environments to exclude Docker images that do not support
+ * PBKDF2WithHmac authentication configurations.
+ */
+public class PBKDF2WithHmacExporterTestEnvironmentFilter implements Predicate<JmxExporterTestEnvironment> {
+
+    private static final Set<String> filteredDockerImages =
+            Set.of("ibmjava:8", "ibmjava:8-jre", "ibmjava:8-sdk", "ibmjava:8-sfj");
+
+    /**
+     * Creates a filter that excludes IBM Java 8 images incompatible with PBKDF2WithHmac.
+     */
+    public PBKDF2WithHmacExporterTestEnvironmentFilter() {
+        // Intentionally empty
+    }
+
+    /**
+     * Returns {@code true} if the test environment's Docker image supports PBKDF2WithHmac.
+     *
+     * @param jmxExporterTestEnvironment the test environment to evaluate
+     * @return {@code true} if the environment is compatible, {@code false} if it should be filtered out
+     */
+    @Override
+    public boolean test(JmxExporterTestEnvironment jmxExporterTestEnvironment) {
+        return !filteredDockerImages.contains(jmxExporterTestEnvironment.getJavaDockerImage());
+    }
+}
